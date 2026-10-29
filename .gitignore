@@ -1,0 +1,19 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+
+# Go 构建缓存
+*.o
+*.a
+
+# 运行时生成的文件（日志等）
+*.log
+
+# 本地配置（含 token 等敏感信息，勿提交真实配置）
+# 如需提交示例配置，可取消注释保护并自行脱敏
+# client.ini
+# server.ini
+# proxy.ini
