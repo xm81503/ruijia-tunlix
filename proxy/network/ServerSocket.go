@@ -6,36 +6,73 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
-var serverConn net.Conn // 服务端与代理端建立的控制连接，用来通知服务端主动建立工作连接
-var connMap sync.Map    // key 为 sessionId，并发安全
-var lock sync.Mutex     // 保护 serverConn 的读写以及对控制连接的写入
+// 多 server 支持：
+// 每台 server 可负责一组 section，启动后用一条控制连接登记它负责的所有 section 名。
+// 代理端据此维护 section 名 -> 控制连接 的路由表，按用户请求携带的 SectionName
+// 把建连通知发往正确的 server 控制连接。
+var connMap sync.Map // key 为 sessionId 的工作连接（全局 uuid，不同 server 间不会碰撞），并发安全
 
-// setServerConn 线程安全地更新控制连接
-func setServerConn(conn net.Conn) {
-	lock.Lock()
-	serverConn = conn
-	lock.Unlock()
+var (
+	ctrlLock     sync.Mutex              // 保护 sectionConns 读写，以及对控制连接的并发写入
+	sectionConns = map[string]net.Conn{} // section 名 -> 负责它的 server 控制连接
+)
+
+// registerControlConn 将一条控制连接登记为 sections 中各 section 的负责连接。
+// 同名 section 的后到连接覆盖先到者（视为该 server 重连）。
+func registerControlConn(conn net.Conn, sections []string) {
+	ctrlLock.Lock()
+	defer ctrlLock.Unlock()
+	for _, name := range sections {
+		if name == "" {
+			continue
+		}
+		sectionConns[name] = conn
+	}
 }
 
-// writeToServerConn 线程安全地向控制连接写入，避免多 goroutine 并发写导致报文交错
-func writeToServerConn(b []byte) (int, error) {
-	lock.Lock()
-	defer lock.Unlock()
-	if serverConn == nil {
+// unregisterControlConn 控制连接断开时，移除其登记的全部 section（仅移除仍指向该 conn 的条目，
+// 避免误删已被同名 server 重连覆盖的新连接）。
+func unregisterControlConn(conn net.Conn) {
+	ctrlLock.Lock()
+	defer ctrlLock.Unlock()
+	for name, c := range sectionConns {
+		if c == conn {
+			delete(sectionConns, name)
+		}
+	}
+}
+
+// writeToSectionConn 线程安全地向负责指定 section 的控制连接写入。
+// 找不到对应控制连接时返回错误（该 section 当前无在线 server）。
+func writeToSectionConn(section string, b []byte) (int, error) {
+	ctrlLock.Lock()
+	defer ctrlLock.Unlock()
+	conn, ok := sectionConns[section]
+	if !ok || conn == nil {
 		return 0, io.ErrClosedPipe
 	}
-	return serverConn.Write(b)
+	return conn.Write(b)
 }
 
-// isServerConnReady 线程安全地判断控制连接是否已就绪
-func isServerConnReady() bool {
-	lock.Lock()
-	defer lock.Unlock()
-	return serverConn != nil
+// writeToConn 线程安全地向指定控制连接写入，与 writeToSectionConn 共用同一把锁，
+// 避免多 goroutine 并发写同一条控制连接导致报文交错。
+func writeToConn(conn net.Conn, b []byte) (int, error) {
+	ctrlLock.Lock()
+	defer ctrlLock.Unlock()
+	return conn.Write(b)
+}
+
+// isSectionReady 线程安全地判断指定 section 是否已有在线的 server 控制连接。
+func isSectionReady(section string) bool {
+	ctrlLock.Lock()
+	defer ctrlLock.Unlock()
+	conn, ok := sectionConns[section]
+	return ok && conn != nil
 }
 
 var authToken string // 代理端配置的合法 token
@@ -69,6 +106,9 @@ func Opt(conn net.Conn) {
 		if sessionId != "" {
 			connMap.Delete(sessionId)
 		}
+		// 若本连接是某些 section 的控制连接，断开时解除其路由登记，
+		// 避免 isSectionReady 对已死控制连接误判为就绪。
+		unregisterControlConn(conn)
 	}()
 
 	for {
@@ -101,9 +141,15 @@ func Opt(conn net.Conn) {
 				Message:     []byte(vo.SUCCESS_MESSAGE),
 			}
 			b, _ := proto.Encode(rspData)
-			// 先登记为控制连接，再通过加锁写入，统一控制连接的并发写互斥
-			setServerConn(conn)
-			writeToServerConn(b)
+			// 心跳包的 Data 携带本 server 负责的 section 列表（逗号分隔）。
+			// 先按列表登记 section -> 控制连接 的路由，再回复心跳。
+			sections := strings.Split(string(result.Data), ",")
+			registerControlConn(conn, sections)
+			// 心跳回复直接回给本控制连接。注册表的锁保护的是跨 goroutine 的控制连接写，
+			// 这里的写与 createServerConnect 的写互斥由 writeToConn 统一加锁。
+			if _, err := writeToConn(conn, b); err != nil {
+				log.Printf("回复心跳失败: %v", err)
+			}
 		case vo.BUILD_SERVER_CONNECTION: // 服务端回连建立的工作连接
 			log.Printf("服务端与代理端成功建立工作连接 sessionId=%s", sessionId)
 			connMap.Store(sessionId, conn)
@@ -164,18 +210,24 @@ func createServerConnect(r vo.NetPackage) net.Conn {
 	}
 	bytes, _ := proto.Encode(reqData)
 
-	// 等待服务端的控制连接就绪（线程安全地读取）
-	for !isServerConnReady() {
-		log.Println("等待服务端与代理端建立控制连接...")
+	section := string(r.SectionName)
+	// 等待负责该 section 的 server 控制连接就绪（带超时避免永久阻塞）
+	ctrlDeadline := time.Now().Add(30 * time.Second)
+	for !isSectionReady(section) {
+		if time.Now().After(ctrlDeadline) {
+			log.Printf("等待 section=%s 的服务端控制连接就绪超时 sessionId=%s", section, string(reqData.SessionId))
+			return nil
+		}
+		log.Printf("等待负责 section=%s 的服务端控制连接...", section)
 		time.Sleep(1 * time.Second)
 	}
 
-	// 通过加锁写入，避免与心跳响应等并发写控制连接导致报文交错
-	if n, err := writeToServerConn(bytes); err != nil {
-		log.Printf("通知服务端建立连接失败: %v", err)
+	// 向负责该 section 的控制连接发建连通知；加锁写入避免与心跳等并发写导致报文交错
+	if n, err := writeToSectionConn(section, bytes); err != nil {
+		log.Printf("通知服务端建立连接失败 section=%s: %v", section, err)
 		return nil
 	} else {
-		log.Printf("通知服务端建立连接成功 size=%d", n)
+		log.Printf("通知服务端建立连接成功 section=%s size=%d", section, n)
 	}
 
 	sessionKey := string(reqData.SessionId)

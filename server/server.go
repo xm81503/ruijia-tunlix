@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +18,20 @@ import (
 var lock sync.Mutex
 var authToken string
 
-func SendServerHeartPackage(conn net.Conn, stop <-chan struct{}) {
+// buildSectionList 汇总本 server 负责的所有 section 名（即 ini 中除 common 外的段），
+// 以逗号分隔，随心跳上报给代理端，供代理端建立 section -> 控制连接 的路由。
+func buildSectionList(sectionMap map[string]vo.IniSection) string {
+	names := make([]string, 0, len(sectionMap))
+	for name := range sectionMap {
+		if name == "common" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return strings.Join(names, ",")
+}
+
+func SendServerHeartPackage(conn net.Conn, sectionList string, stop <-chan struct{}) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("SendServerHeartPackage 发生 panic 已恢复: %v", r)
@@ -35,7 +49,8 @@ func SendServerHeartPackage(conn net.Conn, stop <-chan struct{}) {
 			MessageType: []byte(vo.WK_SERVER_PACAKGE),
 			SessionId:   []byte(sessionId),
 			Token:       []byte(authToken),
-			Data:        []byte("hello"),
+			// Data 携带本 server 负责的 section 列表，供代理端路由登记
+			Data: []byte(sectionList),
 		}
 		reqByte, err := proto.Encode(message)
 		if err != nil {
@@ -83,7 +98,8 @@ func runControlLoop(sectionMap map[string]vo.IniSection, remoteIp string, remote
 
 	// 心跳包处理，连接断开时心跳协程退出
 	stopHeart := make(chan struct{})
-	go SendServerHeartPackage(connection, stopHeart)
+	sectionList := buildSectionList(sectionMap)
+	go SendServerHeartPackage(connection, sectionList, stopHeart)
 	defer close(stopHeart)
 
 	for {
